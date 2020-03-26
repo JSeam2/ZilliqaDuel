@@ -1,0 +1,588 @@
+scilla_version 0
+
+import BoolUtils
+
+(***************************************************)
+(*               Associated library                *)
+(***************************************************)
+library Duel
+
+let one_msg =
+  fun (msg : Message) =>
+  let nil_msg = Nil {Message} in
+  Cons {Message} msg nil_msg
+
+let leq =
+  fun (a : Uint128) =>
+  fun (b : Uint128) =>
+    let c1 = builtin lt a b in
+    let c2 = builtin eq a b in
+    orb c1 c2
+
+(* State machine *)
+let pending = Uint32 0
+let cancel = Uint32 1
+let start = Uint32 2
+let a_win = Uint32 3
+let b_win = Uint32 4
+
+(* we have a 10% tax per game *)
+let tax_rate = Uint128 10
+let contrib_rate = Uint128 90
+
+(* Numbers *)
+let zero = Uint128 0
+let one32 = Uint32 1
+let one = Uint128 1
+let one_hundred = Uint128 100
+
+(* min game contribution amount *)
+let min_contribution = Uint128 100
+
+(***************************************************)
+(*             The contract definition             *)
+(***************************************************)
+
+contract Duel
+(
+    owner: ByStr20
+)
+
+(* Mutable Variables *)
+(*
+    game_num -> 0 (init)
+    game_num -> player A address 
+    game_num -> player B address
+    game_num -> game_state
+    game_num -> total_pot
+    game_num -> funds_left
+    game_num -> player A contribution (equal to player B)
+    game_num -> player B contribution (equal to player A)
+*)
+field game_num : Uint128 = Uint128 0
+field owner_cut : Uint128 = Uint128 0
+
+field player_funds : Map ByStr20 Uint128 = Emp ByStr20 Uint128
+field player_A_address : Map Uint128 ByStr20 = Emp Uint128 ByStr20
+field player_B_address : Map Uint128 ByStr20 = Emp Uint128 ByStr20
+field game_state : Map Uint128 Uint32 = Emp Uint128 Uint32
+(* Total pot to record game funds as historical record *)
+field total_pot : Map Uint128 Uint128 = Emp Uint128 Uint128
+(* Funds left to account for fund transfer *)
+field funds_left : Map Uint128 Uint128 = Emp Uint128 Uint128
+field player_A_contribution : Map Uint128 Uint128 = Emp Uint128 Uint128
+field player_B_contribution : Map Uint128 Uint128 = Emp Uint128 Uint128
+
+procedure create_check_contribution (amount : Uint128)
+    insufficient = builtin lt amount min_contribution;
+    match insufficient with
+    | True =>
+        e = {
+            _exception: "Creater () Failed. Insufficient contribution amount."  
+        };
+        throw e
+    | False =>
+    end
+end
+
+procedure create_update_state (sender : ByStr20, amount : Uint128)
+    cur_game_num <- game_num;
+    
+    (* Set player_A_address *)
+    player_A_address[cur_game_num] := sender;
+    
+    (* Set player_A_contribution *)
+    player_A_contribution[cur_game_num] := amount;
+    
+    (* Set game_state to pending *)
+    game_state[cur_game_num] := pending;
+    
+    (* Tax player_A_contribution and add
+       this value to total_pot and funds_left
+    *)
+    contrib_divval = builtin mul contrib_rate amount;
+    contrib_percval = builtin div contrib_divval one_hundred;
+    total_pot[cur_game_num] := contrib_percval;
+    funds_left[cur_game_num] := contrib_percval;
+    
+    (* Add tax into owner_cut *)
+    tax_divval = builtin mul tax_rate amount;
+    tax_percval = builtin div tax_divval one_hundred;
+    cur_owner_cut <- owner_cut;
+    new_owner_cut = builtin add cur_owner_cut tax_percval;
+    owner_cut := new_owner_cut;
+    
+    (* Announce successful creation of game *)
+    e = {
+        _eventname: "Create () Success.";
+        game_num: cur_game_num;
+        player_A_address : sender;
+        player_A_contribution: amount;
+        game_state: pending;
+        total_pot: contrib_percval;
+        funds_left: contrib_percval;
+        owner_cut: new_owner_cut
+    };
+    event e;
+    
+    (* Increment game_num by 1 *)
+    final_game_num = builtin add cur_game_num one;
+    game_num := final_game_num
+end
+
+procedure cancel_check_player_A (game : Uint128, sender : ByStr20)
+    player_A <- player_A_address[game];
+
+    match player_A with 
+    | Some some_player_A =>
+        is_player_A = builtin eq sender some_player_A;
+        match is_player_A with
+        | False =>
+            e = {
+                _exception: "Cancel () Failed. Sender is not player A."
+            };
+            throw e
+        | True =>
+        end
+    | None => 
+        e = {
+            _exception: "Cancel () Failed. Game does not exist."
+        };
+        throw e
+    end 
+end
+
+procedure cancel_check_state (game : Uint128)
+    cur_game_state <- game_state[game];
+
+    match cur_game_state with
+    | Some some_state => 
+        is_pending = builtin eq some_state pending;
+        match is_pending with
+        | False =>
+            e = {
+                _exception: "Cancel () Failed. Game is not in pending state."
+            };
+            throw e
+        | True =>
+        end
+    | None => 
+        e = {
+            _exception: "Cancel () Failed. Game does not exist."
+        };
+        throw e
+    end
+end
+
+procedure cancel_update_state (game : Uint128, sender : ByStr20)
+    cur_game_state <- game_state[game];
+
+    match cur_game_state with
+    | Some some_state => 
+        game_state[game] := cancel;
+
+        (* Transfer funds to player address and remove funds from funds_left *)
+        cur_funds_left <- funds_left[game];
+
+        match cur_funds_left with
+        | Some some_funds => 
+            funds_left[game] := zero;
+            temp_player_funds <- player_funds[sender];
+
+            match temp_player_funds with
+            | Some temp_player_funds => 
+                new_fund = builtin add temp_player_funds some_funds;
+                player_funds[sender] := new_fund;
+                e = {
+                    _eventname: "Cancel () Success.";
+                    game_num: game;
+                    game_state: cancel;
+                    player_A_address: sender;
+                    funds_left: zero;
+                    player_funds: new_fund
+                };
+                event e
+            | None => 
+                player_funds[sender] := some_funds;
+                e = {
+                    _eventname: "Cancel () Success.";
+                    game_num: game;
+                    game_state: cancel;
+                    player_A_address: sender;
+                    funds_left: zero;
+                    player_funds: some_funds
+                };
+                event e
+            end
+
+        | None =>
+        end
+    | None => 
+        e = {
+            _exception: "Cancel () Failed. Game does not exist."
+        };
+        throw e
+    end
+end
+
+procedure send_money (address : ByStr20, amount : Uint128)
+    msg = {
+        _tag: "";
+        _recipient : address;
+        _amount : amount
+    };
+    msgs = one_msg msg;
+    send msgs
+end
+
+procedure join_check_playerB_not_playerA (game: Uint128, playerB : ByStr20)
+    playerA <- player_A_address[game];
+
+    match playerA with 
+    | Some somePlayerA => 
+        is_equal = builtin eq somePlayerA playerB;
+        match is_equal with
+        | True => 
+            e = {
+                _exception: "Join () Failed. Players are the same."
+            };
+            throw e
+        | False =>
+        end
+    | None => 
+        e = {
+            _exception: "Join () Failed. Game does not exist."
+        };
+        throw e
+    end
+end
+
+procedure join_check_contribution(game: Uint128, amount : Uint128)
+    a_contrib <- player_A_contribution[game];
+    match a_contrib with
+    | Some contrib =>
+        is_equal = builtin eq contrib amount;
+        match is_equal with
+        | False =>
+            e = {
+                _exception: "Join () Failed. Contribution is not equal."
+            };
+            throw e
+        | True =>
+        end
+    | None =>
+        e = {
+            _exception: "Join () Failed. Game does not exist."
+        };
+        throw e
+    end
+end
+
+procedure join_check_state (game : Uint128)
+    cur_game_state <- game_state[game];
+
+    match cur_game_state with
+    | Some some_state => 
+        is_pending = builtin eq some_state pending;
+        match is_pending with
+        | False =>
+            e = {
+                _exception: "Join () Failed. Game is not in pending state."
+            };
+            throw e
+        | True =>
+        end
+    | None => 
+        e = {
+            _exception: "Join () Failed. Game does not exist."
+        };
+        throw e
+    end
+end
+
+procedure join_update_state (game: Uint128, sender: ByStr20, amount: Uint128)
+    new_total_pot = zero;
+    new_funds_left = zero;
+    new_owner_cut = zero;
+    
+    (* Set player_B_address *)
+    player_B_address[game] := sender;
+    
+    (* Set player_A_contribution *)
+    player_B_contribution[game] := amount;
+    
+    (* Set game_state to start *)
+    game_state[game] := start;
+    
+    (* Tax player_B_contribution and add
+       this value to total_pot and funds_left
+    *)
+    contrib_divval = builtin mul contrib_rate amount;
+    contrib_percval = builtin div contrib_divval one_hundred;
+
+    cur_total_pot <- total_pot[game];
+    match cur_total_pot with
+    | Some pot => 
+        new_total_pot = builtin add pot contrib_percval;
+        total_pot[game] := new_total_pot
+    | None => 
+        e = {
+            _exception: "Join () Failed. Game does not exist."
+        };
+        throw e
+    end;
+
+    cur_funds_left <- funds_left[game];
+    match cur_funds_left with
+    | Some fund =>
+        new_funds_left = builtin add fund contrib_percval;
+        funds_left[game] := new_funds_left
+    | None =>
+        e = {
+            _exception: "Join () Failed. Game does not exist."
+        };
+        throw e
+    end;
+    
+    (* Add tax into owner_cut *)
+    tax_divval = builtin mul tax_rate amount;
+    tax_percval = builtin div tax_divval one_hundred;
+    cur_owner_cut <- owner_cut;
+    new_owner_cut = builtin add cur_owner_cut tax_percval;
+    owner_cut := new_owner_cut;
+    
+    (* Announce successful creation of game *)
+    e = {
+        _eventname: "Join () Success.";
+        game_num: game;
+        player_B_address : sender;
+        player_B_contribution: amount;
+        game_state: start;
+        total_pot: new_total_pot;
+        funds_left: new_funds_left;
+        owner_cut: new_owner_cut
+    };
+    event e
+end
+
+procedure check_if_owner (sender: ByStr20)
+    is_owner = builtin eq owner sender;
+    match is_owner with
+    | False => 
+        e = {
+            _exception: "Judge () Failed. Sender is not owner."
+        };
+        throw e
+    | True => 
+    end
+end
+
+procedure judge_check_state (game : Uint128)
+    cur_game_state <- game_state[game];
+
+    match cur_game_state with
+    | Some some_state => 
+        is_start = builtin eq some_state start;
+        match is_start with
+        | False =>
+            e = {
+                _exception: "Judge () Failed. Game is not in start state."
+            };
+            throw e
+        | True =>
+        end
+    | None => 
+        e = {
+            _exception: "Judge () Failed. Game does not exist."
+        };
+        throw e
+    end
+end
+
+procedure judge_update_state (game: Uint128, address: ByStr20)
+    cur_funds_left <- funds_left[game];
+    fund_to_transfer = match cur_funds_left with 
+    | Some fund =>
+        fund
+    | None =>
+        zero
+    end;
+    
+    is_zero = builtin eq fund_to_transfer zero;
+    match is_zero with
+    | True => 
+        e = {
+            _exception: "Judge () Failed. funds_left is zero, this should not happen please inform the developers."
+        };
+        throw e
+    | False =>
+    end;
+    
+    funds_left[game] := zero;
+    
+    temp_player_funds <- player_funds[address];
+
+    match temp_player_funds with
+    | Some existing => 
+        total_fund = builtin add existing fund_to_transfer;
+        player_funds[address] := total_fund;
+        e = {
+            _eventname: "Judge () Success.";
+            game_num: game;
+            funds_left: zero;
+            player_funds: total_fund 
+        };
+        event e
+    | None => 
+        player_funds[address] := fund_to_transfer;
+        e = {
+            _eventname: "Judge () Success.";
+            game_num: game;
+            funds_left: zero;
+            player_funds: fund_to_transfer 
+        };
+        event e
+    end
+end
+
+(* Transitions game into pending state *)
+(* Min 100 ZIL contribution *)
+transition Create () 
+    (* Check for contribution amount *)
+    create_check_contribution _amount;
+    
+    (* Update the game state *)
+    create_update_state _sender _amount;
+    
+    (* Accept payment *)
+    accept
+end
+
+(* Transitions game into start state` *)
+transition Join (game : Uint128)
+    (* Check if playerA is not playerB *)
+    join_check_playerB_not_playerA game _sender;
+
+    (* Check if contribution are equal *)
+    join_check_contribution game _amount;
+
+    (* Check if game is pending *)
+    join_check_state game;
+
+    (* Check if contribution are equal *)
+    join_update_state game _sender _amount;
+
+    (* Accept payment *)
+    accept
+end
+
+transition Judge (game : Uint128, player_A_win: Uint32)
+    check_if_owner _sender;
+    judge_check_state game;
+    
+    playerAwin = builtin eq player_A_win one32;
+    
+    match playerAwin with
+    | True =>
+        game_state[game] := a_win;
+        playerAopt <- player_A_address[game];
+        match playerAopt with 
+        | Some playerA =>
+            judge_update_state game playerA
+        | None =>
+            e = {
+                _exception: "Judge () Failed. Player A is missing."
+            };
+            throw e
+        end
+    | False =>
+        game_state[game] := b_win;
+        playerBopt <- player_B_address[game];
+        match playerBopt with 
+        | Some playerB =>
+            judge_update_state game playerB
+        | None =>
+            e = {
+                _exception: "Judge () Failed. Player B is missing."
+            };
+            throw e
+        end
+    end
+end
+
+
+(* Transitions game into cancel state *)
+(* Only Allow Player A to cancel *)
+(* Only Allow Cancellation at ending state *)
+transition Cancel (game : Uint128)
+    (* Check if player A is the one requesting cancellation *)
+    cancel_check_player_A game _sender;
+
+    (* Check if the game is in pending *)
+    cancel_check_state game;
+
+    (* Update game state *)
+    cancel_update_state game _sender
+end
+
+(* Withdraw money from the contract *)
+(* Send money from player_funds[address] *)
+(* If owner send over the owner_cut *)
+transition Withdraw (address : ByStr20)
+    is_owner = builtin eq address owner;
+    owner_money <- owner_cut;
+
+    (* Get owner money *)
+    owner_to_add = match is_owner with 
+    | True =>
+        owner_money
+    | False => 
+        zero
+    end;
+
+    cur_player_funds <- player_funds[address];
+    player_to_add = match cur_player_funds with
+    | Some fund =>
+        fund
+    | None =>
+        zero
+    end;
+
+    acc = builtin add owner_to_add player_to_add;
+    is_zero = builtin eq acc zero;
+    match is_zero with
+    | True => 
+        e = {
+            _exception: "Withdraw () Failed. No funds to withdraw."
+        };
+        throw e
+    | False => 
+        send_money address acc;
+        player_funds[address] := zero;
+        owner_cut := zero;
+        e = {
+            _eventname: "Withdraw () Success.";
+            recipient: address;
+            funds: acc
+        };
+        event e
+    end
+end
+
+transition GetGameNum ()
+    cur_game_num <- game_num;
+    e = {
+        _eventname: "GetGameNum () Success.";
+        game_num: cur_game_num
+    };
+    event e
+end
+
+transition GetOwnerCut ()
+    cur_owner_cut <- owner_cut;
+    e = {
+        _eventname: "GetOwnerCut () Success.";
+        game_num: cur_owner_cut
+    };
+    event e
+end
