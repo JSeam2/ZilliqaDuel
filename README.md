@@ -1,4 +1,5 @@
-# Zilliqa Duel
+# Zilliqa Duel (WORK IN PROGRESS)
+
 ![Load Screen](demo/startscreen.png)
 
 Zilliqa Duel is a gunslinger game. Compete with friends to see who has the fastest finger.

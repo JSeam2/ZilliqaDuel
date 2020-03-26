@@ -72,7 +72,7 @@ function App() {
     const deployedContract = zilliqa.contracts.at(ContractAddress);
 
     console.log('Calling Create ()');
-    var amountZIL = prompt("Input Contribution Amount min 100 ZIL", 100);
+    var amountZIL = prompt("Input Contribution Amount min 100 Qa", 100);
     deployedContract.call(
       'Create',
       [],
@@ -83,7 +83,6 @@ function App() {
         gasPrice: myGasPrice,
         gasLimit: Long.fromNumber(8000),
       },
-      false,
     )
     .then((callTx) => {
       zilliqa.blockchain.getPendingTxn(callTx.id).then((pendingStatus) => {
