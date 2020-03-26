@@ -16,3 +16,6 @@ Zilliqa Duel is a gunslinger game. Compete with friends to see who has the faste
 1. Withdraw your winnings should you win the game!
 
 1. Note that the game creator will tax 10% upon every staking action.
+
+# Alternative Use Cases
+1. Suggested by Chung Tin Long Jonathan "You can use this to settle Asians fighting to pay the bill"
